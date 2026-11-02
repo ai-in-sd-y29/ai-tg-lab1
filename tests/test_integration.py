@@ -120,3 +120,58 @@ async def test_real_db_password_restart_health_and_persistence(database):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await pool.close()
+
+
+async def test_dialogue_repository_isolation_restart_and_pruning(database):
+    from app.repository import Profile, Repository
+
+    settings, docker, wait_until_ready, name = database
+    pool = await create_pool(settings)
+    try:
+        repo = Repository(pool)
+        await repo.initialize()
+        await repo.initialize()  # Повторный запуск не уничтожает данные.
+        assert await repo.profile(11) == Profile()
+        assert await repo.profile(22) == Profile()
+        await repo.set_temperature(11, 0.7)
+        await repo.change_mode(11, "translate")
+        await repo.save_turn(11, "Привет", "Hello", 2)
+        await repo.save_turn(22, "Вопрос 2", "Ответ 2", 2)
+        await pool.close()
+        await asyncio.to_thread(docker, "restart", name)
+        await asyncio.to_thread(wait_until_ready)
+        pool = await create_pool(settings)
+        repo = Repository(pool)
+        await repo.initialize()
+        assert await repo.profile(11) == Profile("translate", 0.7)
+        assert await repo.profile(22) == Profile()
+        assert await repo.history(11, 10) == [
+            {"role": "user", "content": "Привет"},
+            {"role": "assistant", "content": "Hello"},
+        ]
+        await repo.save_turn(11, "Ещё", "More", 2)
+        await repo.save_turn(11, "Последний", "Last", 2)
+        assert [m["content"] for m in await repo.history(11, 10)] == [
+            "Ещё",
+            "More",
+            "Последний",
+            "Last",
+        ]
+        await repo.change_mode(11, "quiz")
+        assert await repo.history(11, 10) == []
+        assert await repo.profile(11) == Profile("quiz", 0.7)
+        assert len(await repo.history(22, 10)) == 2
+        await repo.reset(22)
+        assert await repo.history(22, 10) == []
+        assert await repo.profile(22) == Profile()
+        await repo.save_turn(22, "Вопрос при сбое", None, 2)
+        assert await repo.history(22, 10) == []
+        assert (
+            await pool.fetchval(
+                "SELECT user_text FROM lab1_turns WHERE chat_id=$1",
+                22,
+            )
+            == "Вопрос при сбое"
+        )
+    finally:
+        await pool.close()
