@@ -4,6 +4,7 @@ import logging
 
 from aiogram import Dispatcher
 
+from app.assistant import Assistant
 from app.config import ConfigError, Settings
 from app.db import create_pool
 from app.dialogue import Dialogue
@@ -20,11 +21,16 @@ logger = logging.getLogger("app")
 async def run(settings: Settings) -> None:
     state = HealthState()
     bot = create_bot(settings)
+    llm = OpenAICompatibleClient(settings)
     runner = None
     llm = LLMClient(settings)
     try:
         state.pool = await create_pool(settings)
         logger.info("PostgreSQL подключён: SELECT 1 выполнен.")
+        repository = PostgresRepository(state.pool)
+        await repository.ensure_schema()
+        logger.info("Схема БД проверена. Модель: %s.", settings.llm_model)
+        assistant = Assistant(repository, llm, settings)
         # Начальная проверка токена и маршрута через прокси ограничена по времени.
         async with asyncio.timeout(30):
             me = await bot.get_me()

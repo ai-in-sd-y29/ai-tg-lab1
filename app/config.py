@@ -14,6 +14,15 @@ class ConfigError(ValueError):
     """Ошибка настройки без секретных значений в сообщении."""
 
 
+# Значения temperature, которые пользователь может выбрать в /settings.
+ALLOWED_TEMPERATURES = (0.0, 0.3, 0.7, 1.0)
+DEFAULT_TEMPERATURE = 0.7
+
+# Системная инструкция, few-shot-примеры и сообщение до 4096 символов должны
+# помещаться в лимит истории, иначе модель получит только текущий запрос.
+MIN_HISTORY_CHARS = 8000
+
+
 @dataclass(frozen=True)
 class Settings:
     bot_token: str = field(repr=False)
@@ -47,7 +56,7 @@ class Settings:
         }
 
         def value(key: str, default: str = "") -> str:
-            return values.get(key) or default
+            return (values.get(key) or default).strip()
 
         def port(key: str, default: str) -> int:
             try:
@@ -58,16 +67,28 @@ class Settings:
             except ValueError:
                 raise ConfigError(f"{key}: нужен номер порта от 1 до 65535.") from None
 
-        token = value("BOT_TOKEN")
-        try:
-            validate_token(token)
-        except TokenValidationError:
-            raise ConfigError("BOT_TOKEN: укажите токен, полученный у BotFather.") from None
-        password = value("POSTGRES_PASSWORD")
-        if not password:
-            raise ConfigError("POSTGRES_PASSWORD: пароль базы данных не задан.")
-        proxy = value("TELEGRAM_PROXY_URL")
-        if proxy:
+        def integer(key: str, default: str, low: int, high: int) -> int:
+            try:
+                result = int(value(key, default))
+                if not low <= result <= high:
+                    raise ValueError
+                return result
+            except ValueError:
+                raise ConfigError(f"{key}: нужно целое число от {low} до {high}.") from None
+
+        def number(key: str, default: str, low: float, high: float) -> float:
+            try:
+                result = float(value(key, default))
+                if not low <= result <= high:
+                    raise ValueError
+                return result
+            except ValueError:
+                raise ConfigError(f"{key}: нужно число от {low:g} до {high:g}.") from None
+
+        def proxy_url(key: str) -> str:
+            proxy = value(key)
+            if not proxy:
+                return ""
             try:
                 parsed = urlsplit(proxy)
                 if (
@@ -81,9 +102,19 @@ class Settings:
                     raise ValueError
             except ValueError:
                 raise ConfigError(
-                    "TELEGRAM_PROXY_URL: нужен http://host:port или socks5://host:port; "
+                    f"{key}: нужен http://host:port или socks5://host:port; "
                     "при необходимости добавьте user:password@."
                 ) from None
+            return proxy
+
+        token = value("BOT_TOKEN")
+        try:
+            validate_token(token)
+        except TokenValidationError:
+            raise ConfigError("BOT_TOKEN: укажите токен, полученный у BotFather.") from None
+        password = value("POSTGRES_PASSWORD")
+        if not password:
+            raise ConfigError("POSTGRES_PASSWORD: пароль базы данных не задан.")
         level = value("LOG_LEVEL", "INFO").upper()
         if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ConfigError("LOG_LEVEL: используйте DEBUG, INFO, WARNING, ERROR или CRITICAL.")
@@ -125,7 +156,7 @@ class Settings:
         return cls(
             bot_token=token,
             postgres_password=password,
-            telegram_proxy_url=proxy,
+            telegram_proxy_url=proxy_url("TELEGRAM_PROXY_URL"),
             postgres_host=value("POSTGRES_HOST", "127.0.0.1"),
             postgres_port=port("POSTGRES_PORT", "5432"),
             postgres_db=value("POSTGRES_DB", "bot"),

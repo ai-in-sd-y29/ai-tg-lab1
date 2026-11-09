@@ -44,11 +44,14 @@ async def test_telegram_failure_closes_pool_and_session(monkeypatch):
     )
     monkeypatch.setattr(application, "create_pool", AsyncMock(return_value=pool))
     monkeypatch.setattr(application, "create_bot", Mock(return_value=bot))
+    repository = Mock(ensure_schema=AsyncMock())
+    monkeypatch.setattr(application, "PostgresRepository", Mock(return_value=repository))
     settings = Settings(bot_token="unused", postgres_password="unused")
     # Act
     with pytest.raises(ConnectionError):
         await application.run(settings)
     # Assert
+    repository.ensure_schema.assert_awaited_once()
     pool.close.assert_awaited_once()
     bot.session.close.assert_awaited_once()
 
