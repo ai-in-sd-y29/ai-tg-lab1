@@ -1,133 +1,97 @@
-"""Обработчики Telegram: принимают команды и текст, отвечают пользователю.
-
-Здесь нет SQL, HTTP-запросов к модели и текстов промптов — всё это в Assistant.
-"""
+"""Тонкий Telegram-слой: команды, индикация и доставка текста."""
 
 import logging
-import uuid
 
-from aiogram import Bot, F, Router
-from aiogram.enums import ChatType
-from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+import asyncpg
+from aiogram import F, Router
+from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
 
-from app.assistant import Assistant, chat_hash
-from app.config import ALLOWED_TEMPERATURES
-from app.prompts import MODES
-from app.text_split import split_message
+from app.dialogue import TEMPERATURES, ContextTooLarge, Dialogue
+from app.llm import LLMError
+from app.prompts import MODE_NAMES
 
-logger = logging.getLogger("app.handlers")
-
-TEMPERATURE_CALLBACK = "temperature:"
-UNKNOWN_COMMAND = "Неизвестная команда. Список команд — /start."
-TEXT_ONLY = "Я понимаю только текстовые сообщения."
-INTERNAL_ERROR = "Что-то пошло не так. Попробуйте ещё раз."
-
-
-def start_text() -> str:
-    modes = "\n".join(f"/{m.command} — {m.description}" for m in MODES.values())
-    return (
-        "Привет! Я AI-ассистент студента на основе языковой модели.\n\n"
-        "Режимы (при переключении история очищается):\n"
-        f"{modes}\n\n"
-        "Другие команды:\n"
-        "/settings — режим, модель и temperature\n"
-        "/reset — очистить историю диалога\n\n"
-        "По умолчанию включён режим /study. Просто напишите сообщение."
-    )
+logger = logging.getLogger(__name__)
+HELP = (
+    "Я — AI-ассистент студента. Напишите вопрос или выберите режим:\n"
+    "/study — объяснение программирования (по умолчанию)\n"
+    "/translate — перевод на указанный вами язык\n"
+    "/quiz — учебный опрос по программированию\n"
+    "/settings — режим, модель и температура\n"
+    "/settings 0.7 — установить температуру (0.0, 0.3, 0.7, 1.0)\n"
+    "/reset — очистить историю, сохранив настройки"
+)
+LLM_FAILURE = "Не удалось получить ответ модели. Попробуйте ещё раз немного позже."
+DB_FAILURE = "Не удалось сохранить или прочитать диалог. Попробуйте ещё раз немного позже."
+BAD_TEMPERATURE = "Укажите /settings 0.0, /settings 0.3, /settings 0.7 или /settings 1.0."
 
 
-def temperature_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text=f"{t:.1f}", callback_data=f"{TEMPERATURE_CALLBACK}{t}")
-                for t in ALLOWED_TEMPERATURES
-            ]
-        ]
-    )
+def split_text(text: str, limit: int = 4096) -> list[str]:
+    # Telegram использует UTF-16 для смещений: считаем emoji за две единицы.
+    if limit < 2:
+        raise ValueError("limit must be at least 2")
+    chunks, buffer, size = [], [], 0
+    for char in text:
+        width = 2 if ord(char) > 0xFFFF else 1
+        if size + width > limit:
+            chunks.append("".join(buffer))
+            buffer, size = [], 0
+        buffer.append(char)
+        size += width
+    if buffer:
+        chunks.append("".join(buffer))
+    return chunks
 
 
-async def send_long(message: Message, text: str) -> None:
-    # parse_mode=None: ответ модели отправляется как обычный текст без разметки.
-    for part in split_message(text):
-        await message.answer(part, parse_mode=None)
-
-
-async def cmd_start(message: Message) -> None:
-    await message.answer(start_text(), parse_mode=None)
-
-
-async def cmd_mode(message: Message, command: CommandObject, assistant: Assistant) -> None:
-    text = await assistant.switch_mode(message.chat.id, command.command.lower())
-    await message.answer(text, parse_mode=None)
-
-
-async def cmd_reset(message: Message, assistant: Assistant) -> None:
-    await message.answer(await assistant.reset(message.chat.id), parse_mode=None)
-
-
-async def cmd_settings(message: Message, command: CommandObject, assistant: Assistant) -> None:
-    if command.args:
-        text = await assistant.set_temperature(message.chat.id, command.args)
-        await message.answer(text, parse_mode=None)
-        return
-    await message.answer(
-        await assistant.settings_text(message.chat.id),
-        parse_mode=None,
-        reply_markup=temperature_keyboard(),
-    )
-
-
-async def on_temperature(callback: CallbackQuery, assistant: Assistant) -> None:
-    raw = callback.data.removeprefix(TEMPERATURE_CALLBACK)
-    chat_id = callback.message.chat.id
-    text = await assistant.set_temperature(chat_id, raw)
-    await callback.answer()
-    await callback.message.answer(text, parse_mode=None)
-
-
-async def unknown_command(message: Message) -> None:
-    await message.answer(UNKNOWN_COMMAND, parse_mode=None)
-
-
-async def on_text(message: Message, bot: Bot, assistant: Assistant) -> None:
-    request_id = uuid.uuid4().hex[:12]
-    logger.info(
-        "Сообщение получено: request_id=%s chat_hash=%s length=%d",
-        request_id,
-        chat_hash(message.chat.id),
-        len(message.text),
-    )
-    try:
-        # Пока модель думает, Telegram показывает «печатает…».
-        async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-            reply = await assistant.ask(message.chat.id, message.text, request_id)
-    except Exception:
-        logger.exception("Ошибка обработки: request_id=%s", request_id)
-        await message.answer(INTERNAL_ERROR, parse_mode=None)
-        return
-    await send_long(message, reply.text)
-
-
-async def on_other(message: Message) -> None:
-    await message.answer(TEXT_ONLY, parse_mode=None)
+async def handle_text(message: Message, dialogue: Dialogue) -> None:
+    text = message.text or ""
+    chat_id = message.chat.id
+    async with dialogue.user(chat_id):
+        try:
+            await dialogue.repository.profile(chat_id)
+            if text.startswith("/"):
+                command, _, argument = text.partition(" ")
+                command = command.split("@")[0].lower()
+                argument = argument.strip()
+                if command == "/start":
+                    response = HELP
+                elif command[1:] in MODE_NAMES:
+                    mode = command[1:]
+                    await dialogue.repository.change_mode(chat_id, mode)
+                    response = f"Режим: {MODE_NAMES[mode]}. История очищена."
+                elif command == "/reset":
+                    await dialogue.repository.reset(chat_id)
+                    response = "История очищена. Режим и температура сохранены."
+                elif command == "/settings":
+                    if argument:
+                        if argument not in TEMPERATURES:
+                            await message.answer(BAD_TEMPERATURE, parse_mode=None)
+                            return
+                        await dialogue.repository.set_temperature(chat_id, TEMPERATURES[argument])
+                    profile = await dialogue.repository.profile(chat_id)
+                    response = (
+                        f"Режим: {MODE_NAMES[profile.mode]}\n"
+                        f"Модель: {dialogue.settings.llm_model}\n"
+                        f"Температура: {profile.temperature:.1f}"
+                    )
+                else:
+                    response = "Неизвестная команда. Список команд: /start."
+            else:
+                async with ChatActionSender.typing(chat_id=chat_id, bot=message.bot):
+                    completion = await dialogue.answer(chat_id, text)
+                response = completion.text
+        except ContextTooLarge:
+            response = "Сообщение слишком большое для контекста модели. Сократите его."
+        except LLMError:
+            response = LLM_FAILURE
+        except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError):
+            logger.warning("Dialogue storage failure; details omitted")
+            response = DB_FAILURE
+        for part in split_text(response):
+            await message.answer(part, parse_mode=None)
 
 
 def create_router() -> Router:
-    """Новый роутер на каждый Dispatcher: aiogram не разрешает делить один роутер."""
     router = Router(name="assistant")
-    # Бот работает только в личных чатах: группы и каналы игнорируются.
-    router.message.filter(F.chat.type == ChatType.PRIVATE)
-    router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
-    # Порядок важен: команды раньше общего обработчика текста.
-    router.message.register(cmd_start, CommandStart())
-    router.message.register(cmd_mode, Command(*MODES.keys()))
-    router.message.register(cmd_reset, Command("reset"))
-    router.message.register(cmd_settings, Command("settings"))
-    router.callback_query.register(on_temperature, F.data.startswith(TEMPERATURE_CALLBACK))
-    router.message.register(unknown_command, F.text.startswith("/"))
-    router.message.register(on_text, F.text)
-    router.message.register(on_other)
+    router.message.register(handle_text, F.chat.type == "private", F.text)
     return router

@@ -7,11 +7,12 @@ from aiogram import Dispatcher
 from app.assistant import Assistant
 from app.config import ConfigError, Settings
 from app.db import create_pool
+from app.dialogue import Dialogue
 from app.handlers.assistant import create_router
 from app.health import HealthState, start_health_server
-from app.llm import OpenAICompatibleClient
+from app.llm import LLMClient
 from app.logging_setup import configure_logging
-from app.storage import PostgresRepository
+from app.repository import Repository
 from app.telegram import create_bot
 
 logger = logging.getLogger("app")
@@ -22,6 +23,7 @@ async def run(settings: Settings) -> None:
     bot = create_bot(settings)
     llm = OpenAICompatibleClient(settings)
     runner = None
+    llm = LLMClient(settings)
     try:
         state.pool = await create_pool(settings)
         logger.info("PostgreSQL подключён: SELECT 1 выполнен.")
@@ -39,6 +41,9 @@ async def run(settings: Settings) -> None:
                 "или используйте отдельного учебного бота."
             )
         logger.info("Telegram доступен. Бот @%s запускает polling.", me.username)
+        repository = Repository(state.pool)
+        await repository.initialize()
+        dialogue = Dialogue(repository, llm, settings)
         dispatcher = Dispatcher()
         dispatcher.include_router(create_router())
         runner = await start_health_server(state, settings.health_port)
@@ -46,7 +51,7 @@ async def run(settings: Settings) -> None:
             dispatcher.start_polling(
                 bot,
                 db=state.pool,
-                assistant=assistant,
+                dialogue=dialogue,
                 allowed_updates=dispatcher.resolve_used_update_types(),
                 close_bot_session=False,
             )
@@ -71,11 +76,11 @@ async def run(settings: Settings) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="AI-ассистент студента в Telegram")
+    parser = argparse.ArgumentParser(description="AI-ассистент студента")
     parser.add_argument("--env-file", default=".env")
     args = parser.parse_args()
     try:
-        settings = Settings.load(args.env_file)
+        settings = Settings.load(args.env_file, require_llm=True)
     except ConfigError as exc:
         print(str(exc))
         return 1

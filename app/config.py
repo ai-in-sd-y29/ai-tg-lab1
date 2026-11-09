@@ -34,19 +34,21 @@ class Settings:
     postgres_user: str = "bot"
     log_level: str = "INFO"
     health_port: int = 8080
-    llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = field(default="", repr=False)
+    llm_base_url: str = ""
     llm_model: str = ""
-    llm_proxy_url: str = field(default="", repr=False)
-    llm_timeout_seconds: float = 60.0
-    llm_max_output_tokens: int = 1000
-    llm_max_retries: int = 1
+    llm_timeout: int = 45
+    llm_max_tokens: int = 1000
     history_max_messages: int = 20
-    history_max_chars: int = 12000
+    context_max_bytes: int = 24000
 
     @classmethod
     def load(
-        cls, env_file: Path | str = ".env", *, environ: Mapping[str, str] | None = None
+        cls,
+        env_file: Path | str = ".env",
+        *,
+        environ: Mapping[str, str] | None = None,
+        require_llm: bool = False,
     ) -> "Settings":
         values = {
             **dotenv_values(env_file, interpolate=False),
@@ -117,26 +119,40 @@ class Settings:
         if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ConfigError("LOG_LEVEL: используйте DEBUG, INFO, WARNING, ERROR или CRITICAL.")
 
-        base_url = value("LLM_BASE_URL").rstrip("/")
-        parsed_url = urlsplit(base_url)
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
-            raise ConfigError(
-                "LLM_BASE_URL: укажите адрес OpenAI-совместимого API, "
-                "например https://api.openai.com/v1."
-            )
-        if parsed_url.username or parsed_url.password or parsed_url.query:
-            raise ConfigError(
-                "LLM_BASE_URL: адрес не должен содержать логин, пароль или параметры; "
-                "ключ задаётся в LLM_API_KEY."
-            )
-        api_key = value("LLM_API_KEY")
-        if not api_key:
-            raise ConfigError("LLM_API_KEY: ключ доступа к API языковой модели не задан.")
-        model = value("LLM_MODEL")
-        if not model:
-            raise ConfigError("LLM_MODEL: укажите имя модели, например gpt-4.1-mini.")
-        history_chars = integer("HISTORY_MAX_CHARS", "12000", MIN_HISTORY_CHARS, 200000)
+        def positive(key: str, default: int) -> int:
+            try:
+                result = int(value(key, str(default)))
+                if result <= 0:
+                    raise ValueError
+                return result
+            except ValueError:
+                raise ConfigError(f"{key}: нужно положительное целое число.") from None
 
+        llm_key = value("LLM_API_KEY").strip()
+        llm_url = value("LLM_BASE_URL").strip().rstrip("/")
+        llm_model = value("LLM_MODEL").strip()
+        if require_llm or any((llm_key, llm_url, llm_model)):
+            for name, setting in (
+                ("LLM_API_KEY", llm_key),
+                ("LLM_BASE_URL", llm_url),
+                ("LLM_MODEL", llm_model),
+            ):
+                if not setting:
+                    raise ConfigError(f"{name}: обязательная настройка не задана.")
+            try:
+                endpoint = urlsplit(llm_url)
+                if (
+                    endpoint.scheme != "https"
+                    or not endpoint.hostname
+                    or endpoint.username
+                    or endpoint.password
+                    or endpoint.query
+                    or endpoint.fragment
+                ):
+                    raise ValueError
+                _ = endpoint.port
+            except ValueError:
+                raise ConfigError("LLM_BASE_URL: нужен HTTPS-адрес без учётных данных.") from None
         return cls(
             bot_token=token,
             postgres_password=password,
@@ -147,13 +163,11 @@ class Settings:
             postgres_user=value("POSTGRES_USER", "bot"),
             log_level=level,
             health_port=port("HEALTH_PORT", "8080"),
-            llm_base_url=base_url,
-            llm_api_key=api_key,
-            llm_model=model,
-            llm_proxy_url=proxy_url("LLM_PROXY_URL"),
-            llm_timeout_seconds=number("LLM_TIMEOUT_SECONDS", "60", 1, 600),
-            llm_max_output_tokens=integer("LLM_MAX_OUTPUT_TOKENS", "1000", 16, 32000),
-            llm_max_retries=integer("LLM_MAX_RETRIES", "1", 0, 3),
-            history_max_messages=integer("HISTORY_MAX_MESSAGES", "20", 0, 200),
-            history_max_chars=history_chars,
+            llm_api_key=llm_key,
+            llm_base_url=llm_url,
+            llm_model=llm_model,
+            llm_timeout=positive("LLM_TIMEOUT", 45),
+            llm_max_tokens=positive("LLM_MAX_TOKENS", 1000),
+            history_max_messages=positive("HISTORY_MAX_MESSAGES", 20),
+            context_max_bytes=positive("CONTEXT_MAX_BYTES", 24000),
         )

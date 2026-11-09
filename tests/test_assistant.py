@@ -1,367 +1,290 @@
-"""Обязательные сценарии лабораторной № 1 через настоящий Dispatcher aiogram.
-
-Telegram и LLM API подменены: ответы модели задаются в тесте, а отправленные
-боту методы Telegram перехватываются и проверяются по точному тексту.
-"""
+import asyncio
+from dataclasses import replace
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
+from aiogram import Bot, Dispatcher
+from aiogram.methods import SendMessage
+from aiogram.types import Chat, Message, PhotoSize, Update, User
 
-from app.assistant import (
-    ERROR_EMPTY,
-    ERROR_REJECTED,
-    ERROR_TIMEOUT,
-    ERROR_UNAVAILABLE,
-    TRUNCATED_NOTE,
-    trim_history,
+from app.config import ConfigError, Settings
+from app.dialogue import ContextTooLarge, Dialogue, build_context, context_bytes
+from app.handlers.assistant import (
+    BAD_TEMPERATURE,
+    HELP,
+    LLM_FAILURE,
+    create_router,
+    split_text,
 )
-from app.config import DEFAULT_TEMPERATURE
-from app.handlers.assistant import INTERNAL_ERROR, TEXT_ONLY, UNKNOWN_COMMAND, start_text
-from app.llm import (
-    ChatMessage,
-    LLMEmptyResponseError,
-    LLMRequestError,
-    LLMResult,
-    LLMTimeoutError,
-    LLMUnavailableError,
-)
-from app.prompts import MODES
-from app.text_split import TELEGRAM_LIMIT, utf16_len
+from app.llm import Completion, LLMError
+from app.prompts import PROMPTS
+from app.repository import Profile
 
-ALICE, BOB = 1001, 2002
+TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"
 
 
-# 1. Обычное сообщение передаётся модели с инструкцией активного режима.
-async def test_message_goes_to_llm_with_active_mode_prompt(harness_factory):
-    # Arrange
-    harness = harness_factory("Список — это изменяемая последовательность.")
-    harness.llm.delay = 0.05  # «заметное» время ответа, чтобы появился статус
-    # Act
-    await harness.send(ALICE, "Что такое список в Python?")
-    # Assert
-    call = harness.llm.calls[0]
-    assert call["messages"] == [
-        ChatMessage("system", MODES["study"].system_prompt),
-        ChatMessage("user", "Что такое список в Python?"),
+class MemoryRepository:
+    """Подмена только хранилища; SQL отдельно проверяется реальной PostgreSQL."""
+
+    def __init__(self):
+        self.profiles = {}
+        self.messages = {}
+        self.failed = {}
+
+    async def profile(self, chat_id):
+        return self.profiles.setdefault(chat_id, Profile())
+
+    async def history(self, chat_id, max_turns):
+        return list(self.messages.get(chat_id, []))[-max_turns * 2 :] if max_turns else []
+
+    async def save_turn(self, chat_id, question, answer, max_turns):
+        if answer is None:
+            self.failed.setdefault(chat_id, []).append(question)
+            return
+        items = self.messages.setdefault(chat_id, [])
+        items.extend(
+            [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
+        )
+        self.messages[chat_id] = items[-max_turns * 2 :]
+
+    async def reset(self, chat_id):
+        self.messages.pop(chat_id, None)
+
+    async def change_mode(self, chat_id, mode):
+        self.profiles[chat_id] = replace(await self.profile(chat_id), mode=mode)
+        await self.reset(chat_id)
+
+    async def set_temperature(self, chat_id, temperature):
+        self.profiles[chat_id] = replace(await self.profile(chat_id), temperature=temperature)
+
+
+@pytest.fixture
+async def harness():
+    repo = MemoryRepository()
+    llm = AsyncMock()
+    llm.complete.return_value = Completion("Ответ", {}, "test-model")
+    settings = Settings(bot_token=TOKEN, postgres_password="test", llm_model="test-model")
+    dialogue = Dialogue(repo, llm, settings)
+    bot = Bot(TOKEN)
+    bot.session = AsyncMock()
+    dispatcher = Dispatcher()
+    dispatcher.include_router(create_router())
+    counter = 0
+
+    async def send(text, chat_id=42, chat_type="private", photo=False):
+        nonlocal counter
+        counter += 1
+        bot.session.reset_mock()
+        message = Message(
+            message_id=counter,
+            date=datetime.now(UTC),
+            chat=Chat(id=chat_id, type=chat_type),
+            from_user=User(id=chat_id, is_bot=False, first_name="Test"),
+            text=None if photo else text,
+            photo=[PhotoSize(file_id="a", file_unique_id="b", width=1, height=1)]
+            if photo
+            else None,
+        )
+        await dispatcher.feed_update(
+            bot, Update(update_id=counter, message=message), dialogue=dialogue
+        )
+        return [
+            call.args[1].text
+            for call in bot.session.call_args_list
+            if isinstance(call.args[1], SendMessage)
+        ]
+
+    yield repo, llm, dialogue, send
+    await bot.session.close()
+
+
+async def test_default_mode_and_roles_order_and_parameters(harness):
+    repo, llm, _, send = harness
+    assert await send("Первый вопрос") == ["Ответ"]
+    llm.complete.assert_awaited_with(
+        [
+            {"role": "system", "content": PROMPTS["study"]},
+            {"role": "user", "content": "Первый вопрос"},
+        ],
+        0.3,
+    )
+    await send("Второй вопрос")
+    assert llm.complete.call_args.args[0] == [
+        {"role": "system", "content": PROMPTS["study"]},
+        {"role": "user", "content": "Первый вопрос"},
+        {"role": "assistant", "content": "Ответ"},
+        {"role": "user", "content": "Второй вопрос"},
     ]
-    assert call["temperature"] == DEFAULT_TEMPERATURE
-    assert harness.sent_texts(ALICE) == ["Список — это изменяемая последовательность."]
-    assert harness.sent()[0].parse_mode is None
-    assert harness.chat_actions()[0].action == "typing"
-    assert harness.repository.history[ALICE] == [
-        ChatMessage("user", "Что такое список в Python?"),
-        ChatMessage("assistant", "Список — это изменяемая последовательность."),
+    assert len(repo.messages[42]) == 4
+
+
+async def test_two_users_have_independent_history_and_temperature(harness):
+    _, llm, _, send = harness
+    await send("Секрет первого", 1)
+    await send("/settings 1.0", 1)
+    await send("Второй", 2)
+    assert llm.complete.call_args.args == (
+        [
+            {"role": "system", "content": PROMPTS["study"]},
+            {"role": "user", "content": "Второй"},
+        ],
+        0.3,
+    )
+    await send("Продолжим", 1)
+    assert llm.complete.call_args.args[1] == 1.0
+    assert llm.complete.call_args.args[0][1]["content"] == "Секрет первого"
+
+
+@pytest.mark.parametrize("mode", ["study", "translate", "quiz"])
+async def test_mode_change_clears_history_and_is_not_sent_to_llm(harness, mode):
+    repo, llm, _, send = harness
+    await send("Вопрос")
+    await send("/settings 0.7")
+    llm.complete.reset_mock()
+    await send("/" + mode)
+    assert (await repo.profile(42)) == Profile(mode, 0.7)
+    assert await repo.history(42, 10) == []
+    llm.complete.assert_not_awaited()
+    await send("Новый вопрос")
+    assert llm.complete.call_args.args[0][0]["content"] == PROMPTS[mode]
+
+
+async def test_reset_only_current_user_preserves_settings(harness):
+    repo, llm, _, send = harness
+    await send("Вопрос", 1)
+    await send("Другой вопрос", 2)
+    await send("/settings 0.0", 1)
+    llm.complete.reset_mock()
+    assert await send("/reset", 1) == ["История очищена. Режим и температура сохранены."]
+    assert await repo.history(1, 10) == []
+    assert len(await repo.history(2, 10)) == 2
+    assert (await repo.profile(1)).temperature == 0.0
+    llm.complete.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", ["0.0", "0.3", "0.7", "1.0"])
+async def test_allowed_settings(harness, value):
+    repo, llm, _, send = harness
+    assert await send("/settings " + value) == [
+        f"Режим: Учёба\nМодель: test-model\nТемпература: {value}",
     ]
+    assert (await repo.profile(42)).temperature == float(value)
+    llm.complete.assert_not_awaited()
 
 
-async def test_translate_mode_sends_few_shot_before_history(harness_factory):
-    # Arrange
-    harness = harness_factory("Перевод (русский → английский):\nHello")
-    await harness.send(ALICE, "/translate")
-    # Act
-    await harness.send(ALICE, "на английский: Привет")
-    # Assert
-    messages = harness.llm.calls[0]["messages"]
-    mode = MODES["translate"]
-    assert messages[0] == ChatMessage("system", mode.system_prompt)
-    assert messages[1 : 1 + len(mode.few_shot)] == list(mode.few_shot)
-    assert messages[-1] == ChatMessage("user", "на английский: Привет")
-    assert len(mode.few_shot) >= 2
+@pytest.mark.parametrize("value", ["nan", "0.5", "-1", "2", "0.7 extra", "garbage"])
+async def test_bad_settings_never_reach_api(harness, value):
+    repo, llm, _, send = harness
+    assert await send("/settings " + value) == [BAD_TEMPERATURE]
+    assert (await repo.profile(42)).temperature == 0.3
+    llm.complete.assert_not_awaited()
 
 
-# 2. Истории двух пользователей не смешиваются.
-async def test_histories_of_two_users_are_separate(harness_factory):
-    # Arrange
-    harness = harness_factory("Ответ Алисе 1", "Ответ Бобу 1", "Ответ Алисе 2")
-    # Act
-    await harness.send(ALICE, "Вопрос Алисы 1")
-    await harness.send(BOB, "Вопрос Боба 1")
-    await harness.send(ALICE, "Вопрос Алисы 2")
-    # Assert
-    bob_call, alice_second = harness.llm.calls[1], harness.llm.calls[2]
-    assert bob_call["messages"][1:] == [ChatMessage("user", "Вопрос Боба 1")]
-    assert alice_second["messages"][1:] == [
-        ChatMessage("user", "Вопрос Алисы 1"),
-        ChatMessage("assistant", "Ответ Алисе 1"),
-        ChatMessage("user", "Вопрос Алисы 2"),
-    ]
-    assert harness.sent_texts(BOB) == ["Ответ Бобу 1"]
+async def test_llm_error_safe_and_not_persisted(harness):
+    repo, llm, _, send = harness
+    llm.complete.side_effect = LLMError("private-technical-detail")
+    assert await send("Вопрос") == [LLM_FAILURE]
+    assert await repo.history(42, 10) == []
+    assert repo.failed[42] == ["Вопрос"]
 
 
-# 3. Сокращение истории без потери текущего запроса и нарушения порядка.
-async def test_history_is_trimmed_by_message_count(harness_factory):
-    # Arrange
-    harness = harness_factory(history_max_messages=4)
-    for i in range(1, 6):
-        await harness.repository.append_exchange(ALICE, f"вопрос {i}", f"ответ {i}")
-    # Act
-    await harness.send(ALICE, "текущий вопрос")
-    # Assert
-    assert harness.llm.calls[0]["messages"][1:] == [
-        ChatMessage("user", "вопрос 4"),
-        ChatMessage("assistant", "ответ 4"),
-        ChatMessage("user", "вопрос 5"),
-        ChatMessage("assistant", "ответ 5"),
-        ChatMessage("user", "текущий вопрос"),
-    ]
+async def test_long_answer_sent_in_order_without_losing_characters(harness):
+    _, llm, _, send = harness
+    text = "<b>Ответ</b>\n" + "🙂" * 3000 + "a" * 4097
+    llm.complete.return_value = Completion(text, {}, "test")
+    parts = await send("Вопрос")
+    assert "".join(parts) == text
+    assert all(0 < len(p.encode("utf-16-le")) // 2 <= 4096 for p in parts)
 
 
-async def test_history_is_trimmed_by_size_and_fits_limit(harness_factory):
-    # Arrange
-    limit = 8000
-    harness = harness_factory(history_max_messages=50, history_max_chars=limit)
-    for i in range(10):
-        await harness.repository.append_exchange(ALICE, f"q{i} " + "в" * 700, f"a{i} " + "о" * 700)
-    current = "текущий " + "я" * 3000
-    # Act
-    await harness.send(ALICE, current)
-    # Assert
-    messages = harness.llm.calls[0]["messages"]
-    history = messages[1:-1]
-    assert messages[-1] == ChatMessage("user", current)
-    assert sum(len(m.content) for m in messages) <= limit
-    assert history, "часть истории должна остаться"
-    assert history[0].role == "user"
-    assert [m.content[:3] for m in history] == [
-        f"{role}{i} " for i in range(10 - len(history) // 2, 10) for role in ("q", "a")
-    ]
+async def test_commands_private_chat_and_text_filter(harness):
+    _, llm, _, send = harness
+    assert await send("/start") == [HELP]
+    assert await send("/unknown") == ["Неизвестная команда. Список команд: /start."]
+    assert await send("Вопрос", chat_type="group") == []
+    assert await send("", photo=True) == []
+    llm.complete.assert_not_awaited()
 
 
-def test_trim_history_never_starts_with_assistant_message():
-    # Arrange
+def test_context_trims_whole_old_pairs_and_preserves_current_and_system():
     history = [
-        ChatMessage("user", "длинный вопрос " * 10),
-        ChatMessage("assistant", "a1"),
-        ChatMessage("user", "q2"),
-        ChatMessage("assistant", "a2"),
+        {"role": role, "content": f"{n}{role}"} for n in range(4) for role in ("user", "assistant")
     ]
-    # Act
-    trimmed = trim_history(history, max_messages=10, budget_chars=10)
-    # Assert
-    assert trimmed == [ChatMessage("user", "q2"), ChatMessage("assistant", "a2")]
-
-
-def test_trim_history_with_no_budget_keeps_nothing():
-    # Arrange
-    history = [ChatMessage("user", "q"), ChatMessage("assistant", "a")]
-    # Act / Assert
-    assert trim_history(history, max_messages=10, budget_chars=-5) == []
-    assert trim_history(history, max_messages=0, budget_chars=1000) == []
-
-
-# 4. Смена режима очищает историю и сохраняет новую настройку.
-async def test_mode_switch_clears_history_and_saves_mode(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    await harness.repository.append_exchange(ALICE, "старый вопрос", "старый ответ")
-    await harness.repository.set_temperature(ALICE, 0.3)
-    # Act
-    await harness.send(ALICE, "/quiz")
-    # Assert
-    assert harness.repository.settings[ALICE].mode == "quiz"
-    assert harness.repository.settings[ALICE].temperature == 0.3
-    assert ALICE not in harness.repository.history
-    assert harness.llm.calls == []
-    assert harness.sent_texts(ALICE) == [
-        "Режим «Тренажёр» (/quiz) включён. История очищена.\n"
-        "Назовите тему, например «SQL JOIN», — я задам первый вопрос."
+    context = build_context("system", history, "current", 5, 10000)
+    assert context == [
+        {"role": "system", "content": "system"},
+        *history[-4:],
+        {"role": "user", "content": "current"},
     ]
-
-
-async def test_next_message_after_switch_uses_new_prompt(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    await harness.send(ALICE, "/quiz")
-    # Act
-    await harness.send(ALICE, "рекурсия")
-    # Assert
-    assert harness.llm.calls[0]["messages"][0].content == MODES["quiz"].system_prompt
-
-
-# 5. /reset очищает только историю вызвавшего пользователя.
-async def test_reset_clears_only_caller_history(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    await harness.repository.append_exchange(ALICE, "qa", "aa")
-    await harness.repository.append_exchange(BOB, "qb", "ab")
-    await harness.repository.set_mode(ALICE, "translate")
-    await harness.repository.append_exchange(ALICE, "qa2", "aa2")
-    await harness.repository.set_temperature(ALICE, 1.0)
-    # Act
-    await harness.send(ALICE, "/reset")
-    # Assert
-    assert ALICE not in harness.repository.history
-    assert harness.repository.history[BOB] == [
-        ChatMessage("user", "qb"),
-        ChatMessage("assistant", "ab"),
+    budget = context_bytes([context[0], *history[-2:], context[-1]])
+    assert build_context("system", history, "current", 20, budget) == [
+        context[0],
+        *history[-2:],
+        context[-1],
     ]
-    assert harness.repository.settings[ALICE].mode == "translate"
-    assert harness.repository.settings[ALICE].temperature == 1.0
-    assert harness.sent_texts(ALICE) == ["История диалога очищена. Режим и temperature сохранены."]
+    with pytest.raises(ContextTooLarge):
+        build_context("system", history, "current" * 100, 20, 100)
+    assert build_context("system", history, "current", 1, 10000) == [context[0], context[-1]]
 
 
-# 6. /settings принимает разрешённое и отклоняет некорректное значение.
-async def test_settings_shows_current_values(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    # Act
-    await harness.send(ALICE, "/settings")
-    # Assert
-    message = harness.sent()[0]
-    assert message.text == (
-        "Текущие настройки:\n"
-        "Режим: Учёба (/study)\n"
-        "Модель: test-model\n"
-        "Temperature: 0.7\n\n"
-        "Выберите temperature кнопкой ниже или командой /settings 0.3 "
-        "(допустимо: 0.0, 0.3, 0.7, 1.0)."
-    )
-    buttons = message.reply_markup.inline_keyboard[0]
-    assert [b.text for b in buttons] == ["0.0", "0.3", "0.7", "1.0"]
-
-
-async def test_settings_accepts_allowed_value_and_applies_it(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    # Act
-    await harness.send(ALICE, "/settings 0,3")
-    await harness.send(ALICE, "вопрос")
-    # Assert
-    assert harness.sent_texts(ALICE)[0] == (
-        "Temperature = 0.3 сохранена и применится со следующего запроса."
-    )
-    assert harness.repository.settings[ALICE].temperature == 0.3
-    assert harness.llm.calls[0]["temperature"] == 0.3
-    assert BOB not in harness.repository.settings
-
-
-@pytest.mark.parametrize("value", ["0.5", "2", "-0.3", "abc", "nan", "inf"])
-async def test_settings_rejects_invalid_value_before_api(harness_factory, value):
-    # Arrange
-    harness = harness_factory()
-    # Act
-    await harness.send(ALICE, f"/settings {value}")
-    # Assert
-    assert harness.sent_texts(ALICE) == [
-        "Недопустимое значение temperature. Выберите одно из: 0.0, 0.3, 0.7, 1.0."
+async def test_context_limit_applied_to_actual_api_request(harness):
+    _, llm, dialogue, send = harness
+    dialogue.settings = replace(dialogue.settings, history_max_messages=3)
+    await send("Первый")
+    await send("Второй")
+    await send("Третий")
+    assert [m["content"] for m in llm.complete.call_args.args[0][1:]] == [
+        "Второй",
+        "Ответ",
+        "Третий",
     ]
-    assert ALICE not in harness.repository.settings
-    assert harness.llm.calls == []
-
-
-async def test_settings_button_saves_value(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    # Act
-    await harness.press(ALICE, "temperature:1.0")
-    await harness.press(ALICE, "temperature:0.9")
-    # Assert
-    assert harness.repository.settings[ALICE].temperature == 1.0
-    assert harness.sent_texts(ALICE) == [
-        "Temperature = 1.0 сохранена и применится со следующего запроса.",
-        "Недопустимое значение temperature. Выберите одно из: 0.0, 0.3, 0.7, 1.0.",
+    dialogue.settings = replace(dialogue.settings, context_max_bytes=10)
+    llm.complete.reset_mock()
+    assert await send("Большой") == [
+        "Сообщение слишком большое для контекста модели. Сократите его.",
     ]
-    assert len(harness.callback_answers()) == 2
+    llm.complete.assert_not_awaited()
 
 
-# 7. Ошибка LLM преобразуется в безопасное пользовательское сообщение.
-@pytest.mark.parametrize(
-    ("error", "expected"),
-    [
-        (LLMTimeoutError("нет ответа за 60 с"), ERROR_TIMEOUT),
-        (LLMUnavailableError("HTTP 503"), ERROR_UNAVAILABLE),
-        (LLMRequestError("HTTP 401: invalid key sk-test-secret", 401), ERROR_REJECTED),
-        (LLMEmptyResponseError("в ответе нет текста"), ERROR_EMPTY),
-    ],
-)
-async def test_llm_error_becomes_safe_message(harness_factory, error, expected):
-    # Arrange
-    harness = harness_factory(error)
-    await harness.repository.append_exchange(ALICE, "прошлый вопрос", "прошлый ответ")
-    # Act
-    await harness.send(ALICE, "новый вопрос")
-    # Assert
-    assert harness.sent_texts(ALICE) == [expected]
-    assert harness.repository.history[ALICE] == [
-        ChatMessage("user", "прошлый вопрос"),
-        ChatMessage("assistant", "прошлый ответ"),
-    ]
-    assert "sk-test-secret" not in expected
-    assert MODES["study"].system_prompt[:40] not in expected
+async def test_user_lock_serializes_and_releases_after_cancel(harness):
+    _, _, dialogue, _ = harness
+    entered = asyncio.Event()
+
+    async def waiter():
+        async with dialogue.user(1):
+            entered.set()
+
+    async with dialogue.user(1):
+        task = asyncio.create_task(waiter())
+        await asyncio.sleep(0)
+        assert not entered.is_set()
+        async with dialogue.user(2):
+            pass
+    await task
+    assert entered.is_set()
+    assert dialogue._locks == {}
+    async with dialogue.user(1):
+        task = asyncio.create_task(waiter())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert dialogue._locks == {}
 
 
-async def test_unexpected_error_hides_details(harness_factory):
-    # Arrange
-    harness = harness_factory(RuntimeError("password=secret traceback"))
-    # Act
-    await harness.send(ALICE, "вопрос")
-    # Assert
-    assert harness.sent_texts(ALICE) == [INTERNAL_ERROR]
+def test_required_llm_configuration_and_secret_repr(tmp_path):
+    env = {"BOT_TOKEN": TOKEN, "POSTGRES_PASSWORD": "test"}
+    with pytest.raises(ConfigError, match="LLM_API_KEY"):
+        Settings.load(tmp_path / "missing", environ=env, require_llm=True)
+    env.update(LLM_API_KEY="private-key", LLM_BASE_URL="https://example.org/v1", LLM_MODEL="m")
+    settings = Settings.load(tmp_path / "missing", environ=env, require_llm=True)
+    assert "private-key" not in repr(settings)
+    env["LLM_BASE_URL"] = "https://user:private-password@example.org/v1"
+    with pytest.raises(ConfigError) as error:
+        Settings.load(tmp_path / "missing", environ=env, require_llm=True)
+    assert "private-password" not in str(error.value)
 
 
-async def test_truncated_answer_is_marked(harness_factory):
-    # Arrange
-    result = LLMResult(text="Начало ответа", model="test-model", finish_reason="length")
-    harness = harness_factory(result)
-    # Act
-    await harness.send(ALICE, "вопрос")
-    # Assert
-    assert harness.sent_texts(ALICE) == ["Начало ответа" + TRUNCATED_NOTE]
-
-
-# 8. Ответ длиннее 4096 символов разбивается и отправляется без потери текста.
-async def test_long_answer_is_split_without_loss(harness_factory):
-    # Arrange
-    paragraphs = [f"Абзац {i}: " + "слово " * 150 for i in range(12)]
-    answer = "\n\n".join(p.strip() for p in paragraphs) + " 🎉" * 50
-    harness = harness_factory(answer)
-    # Act
-    await harness.send(ALICE, "длинный вопрос")
-    # Assert
-    parts = harness.sent_texts(ALICE)
-    assert len(parts) >= 3
-    assert all(0 < utf16_len(p) <= TELEGRAM_LIMIT for p in parts)
-    assert "".join(parts) == answer
-    assert parts[0].startswith("Абзац 0:")
-
-
-# Команды и фильтры.
-async def test_start_lists_commands(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    # Act
-    await harness.send(ALICE, "/start")
-    # Assert
-    assert harness.sent_texts(ALICE) == [start_text()]
-    for command in ("/study", "/translate", "/quiz", "/settings", "/reset"):
-        assert command in start_text()
-    assert harness.llm.calls == []
-
-
-async def test_unknown_command_is_not_sent_to_llm(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    # Act
-    await harness.send(ALICE, "/weather")
-    # Assert
-    assert harness.sent_texts(ALICE) == [UNKNOWN_COMMAND]
-    assert harness.llm.calls == []
-
-
-async def test_group_messages_are_ignored(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    # Act
-    await harness.send(-100500, "вопрос в группе", chat_type="group")
-    # Assert
-    assert harness.sent() == []
-    assert harness.llm.calls == []
-
-
-async def test_non_text_message_gets_hint(harness_factory):
-    # Arrange
-    harness = harness_factory()
-    # Act
-    await harness.send(ALICE, None)
-    # Assert
-    assert harness.sent_texts(ALICE) == [TEXT_ONLY]
-    assert harness.llm.calls == []
+def test_split_empty_does_not_create_empty_message():
+    assert split_text("") == []
