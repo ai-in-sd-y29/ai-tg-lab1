@@ -120,3 +120,53 @@ async def test_real_db_password_restart_health_and_persistence(database):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await pool.close()
+
+
+async def test_repository_persists_settings_and_history_after_restart(database):
+    # Arrange
+    from app.llm import ChatMessage
+    from app.storage import PostgresRepository, UserSettings
+
+    settings, docker, wait_until_ready, name = database
+    pool = await create_pool(settings)
+    try:
+        repository = PostgresRepository(pool)
+        await repository.ensure_schema()
+        await repository.ensure_schema()  # повторный запуск не ломает схему
+        # Act
+        assert await repository.get_settings(1) == UserSettings()
+        await repository.set_temperature(1, 0.3)
+        await repository.append_exchange(1, "вопрос 1 👋", "ответ 1")
+        await repository.append_exchange(1, "вопрос 2", "ответ 2")
+        await repository.append_exchange(2, "чужой вопрос", "чужой ответ")
+        await repository.set_mode(3, "translate")
+        # Assert
+        assert await repository.get_history(1, 3) == [
+            ChatMessage("assistant", "ответ 1"),
+            ChatMessage("user", "вопрос 2"),
+            ChatMessage("assistant", "ответ 2"),
+        ]
+        assert await repository.get_settings(1) == UserSettings(mode="study", temperature=0.3)
+        assert await repository.get_settings(3) == UserSettings(mode="translate", temperature=0.7)
+    finally:
+        await pool.close()
+
+    # Act: перезапуск БД и нового процесса приложения.
+    await asyncio.to_thread(docker, "restart", name)
+    await asyncio.to_thread(wait_until_ready)
+    pool = await create_pool(settings)
+    try:
+        repository = PostgresRepository(pool)
+        await repository.ensure_schema()
+        # Assert: данные сохранились, пользователи разделены.
+        assert len(await repository.get_history(1, 50)) == 4
+        assert await repository.get_history(1, 1) == [ChatMessage("assistant", "ответ 2")]
+        assert (await repository.get_settings(1)).temperature == 0.3
+        await repository.set_mode(1, "quiz")
+        assert await repository.get_history(1, 50) == []
+        assert (await repository.get_settings(1)).temperature == 0.3
+        assert len(await repository.get_history(2, 50)) == 2
+        await repository.clear_history(2)
+        assert await repository.get_history(2, 50) == []
+    finally:
+        await pool.close()

@@ -21,6 +21,7 @@ def prepare_env(
     *,
     cloud: bool,
     ask: Callable[[str], str] = getpass.getpass,
+    ask_visible: Callable[[str], str] = input,
     environ: Mapping[str, str] | None = None,
 ) -> Path:
     path = root / (".env.cloud" if cloud else ".env")
@@ -35,6 +36,7 @@ def prepare_env(
         "POSTGRES_USER": "bot",
         "LOG_LEVEL": "INFO",
         "HEALTH_PORT": "8080",
+        "LLM_BASE_URL": "https://api.openai.com/v1",
     }
     for key, default in defaults.items():
         if not values.get(key):
@@ -47,6 +49,10 @@ def prepare_env(
         updates["TELEGRAM_PROXY_URL"] = ask(
             "URL HTTP/SOCKS5 прокси (ввод скрыт; локально Enter — без прокси): "
         ).strip()
+    if not values.get("LLM_API_KEY"):
+        updates["LLM_API_KEY"] = ask("Ключ API языковой модели (ввод скрыт): ").strip()
+    if not values.get("LLM_MODEL"):
+        updates["LLM_MODEL"] = ask_visible("Имя модели, например gpt-4.1-mini: ").strip()
     merged = {**values, **updates}
     if cloud and not merged.get("TELEGRAM_PROXY_URL"):
         raise ConfigError("Для облака необходимо указать внешний прокси Telegram.")

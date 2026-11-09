@@ -14,3 +14,4 @@ htmlcov/
 .idea/
 /docs/verification.md
 /docs/presentations/*-notes.md
+.claude/settings.local.json
