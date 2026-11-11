@@ -1,8 +1,10 @@
-# AI-ассистент студента: лабораторная №1
+# AI-ассистент студента: лабораторные 1 и 2
 
-Telegram-бот на aiogram с YandexGPT через OpenAI-совместимый API и постоянной историей в PostgreSQL. Реализована лабораторная №1: `/study`, `/translate`, `/quiz`, `/settings` и `/reset`. Возможности лабораторных №2 и №3 не добавлены.
+Telegram-бот на aiogram с YandexGPT и PostgreSQL. Сохранены `/study`, `/translate`, `/quiz`, `/settings` и `/reset`. Добавлены MCP-сервер stdio, погода, расписание и подтверждённые напоминания. Доставка уведомлений относится к лабораторной 3 и пока не реализована.
 
-Архитектура, эксперимент и подготовка к защите: [отчёт](docs/lab1-report.md), [полные 12 ответов и сравнение промптов](docs/lab1-experiment.json), [сценарий демонстрации](docs/lab1-demo.md).
+Лабораторная 1: [отчёт Word](docs/lab1-report.docx), [эксперимент](docs/lab1-experiment.json), [демонстрация](docs/lab1-demo.md).
+
+Лабораторная 2: [запуск, архитектура, настройки и проверки](docs/lab2.md), [отчёт Word](docs/lab2-report.docx), [демонстрация](docs/lab2-demo.md), [результаты эксперимента](docs/lab2-routing-final.json). Правила проекта: [AGENTS.md](AGENTS.md), [spec.md](spec.md), [plan.md](plan.md).
 
 **Локально:** Python работает на вашем компьютере, PostgreSQL — в Docker. **В Yandex Cloud:** оба компонента работают в Docker на одной ВМ. Доступ бота к Telegram из облака проходит через внешний HTTP/SOCKS5-прокси.
 

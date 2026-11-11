@@ -175,3 +175,113 @@ async def test_dialogue_repository_isolation_restart_and_pruning(database):
         )
     finally:
         await pool.close()
+
+
+async def test_lab2_real_postgres_concurrency_isolation_expiry_and_restart(database):
+    from datetime import UTC, datetime, timedelta
+
+    from app.lab2_models import AgentError, ReminderArgs
+    from app.lab2_repository import AgentRepository
+
+    settings, docker, wait_until_ready, name = database
+    pool = await create_pool(settings)
+    try:
+        repo = AgentRepository(pool)
+        await repo.initialize()
+        await repo.initialize()
+        await repo.set_timezone(11, "Europe/Moscow")
+        assert await repo.timezone(22) is None
+        future = datetime.now(UTC) + timedelta(days=1)
+        from zoneinfo import ZoneInfo
+
+        args = ReminderArgs(
+            text="Учебное напоминание",
+            remind_at=future.astimezone(ZoneInfo("Europe/Moscow")).isoformat(),
+        )
+        prepared = await asyncio.gather(
+            *(repo.prepare(11, 100, args, "Europe/Moscow") for _ in range(8))
+        )
+        assert len({str(r["id"]) for r in prepared}) == 1
+        assert await pool.fetchval("SELECT count(*) FROM lab2_actions") == 1
+        identity = str(prepared[0]["id"])
+        with pytest.raises(AgentError, match="confirmation_missing"):
+            await repo.confirm(22, identity)
+        with pytest.raises(AgentError, match="confirmation_required"):
+            await repo.complete(identity, args)
+        await pool.close()
+        await asyncio.to_thread(docker, "restart", name)
+        await asyncio.to_thread(wait_until_ready)
+        pool = await create_pool(settings)
+        repo = AgentRepository(pool)
+        assert await repo.timezone(11) == "Europe/Moscow"
+        await asyncio.gather(*(repo.confirm(11, identity) for _ in range(8)))
+        results = await asyncio.gather(*(repo.complete(identity, args) for _ in range(8)))
+        assert sum(r.created for r in results) == 1
+        assert len({r.id for r in results}) == 1
+        assert await pool.fetchval("SELECT count(*) FROM lab2_reminders") == 1
+        with pytest.raises(AgentError, match="confirmation_mismatch"):
+            await repo.complete(identity, args.model_copy(update={"text": "Другой текст"}))
+        expired = await repo.prepare(11, 101, args, "Europe/Moscow")
+        await pool.execute(
+            "UPDATE lab2_actions SET expires_at=now()-interval '1 second' WHERE id=$1",
+            expired["id"],
+        )
+        with pytest.raises(AgentError, match="confirmation_expired"):
+            await repo.confirm(11, str(expired["id"]))
+        assert (
+            await pool.fetchval("SELECT status FROM lab2_actions WHERE id=$1", expired["id"])
+            == "expired"
+        )
+        cancelled = await repo.prepare(11, 102, args, "Europe/Moscow")
+        with pytest.raises(AgentError, match="confirmation_cancelled"):
+            await repo.confirm(11, str(cancelled["id"]), True)
+        with pytest.raises(AgentError, match="confirmation_required"):
+            await repo.complete(str(cancelled["id"]), args)
+        await repo.audit(11, "respond", None, {}, "passed", "success", "Обычный ответ", 1)
+        assert await repo.last_audit(22) is None
+        assert (await repo.last_audit(11))["reason"] == "Обычный ответ"
+        assert await pool.fetchval("SELECT count(*) FROM lab2_reminders") == 1
+    finally:
+        await pool.close()
+
+
+async def test_lab2_real_stdio_mcp_with_postgres(database):
+    from datetime import UTC, datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from mcp import Client
+
+    from app.lab2_models import ReminderArgs
+    from app.lab2_repository import AgentRepository
+    from app.mcp_client import ToolGateway, server_parameters
+
+    settings, *_ = database
+    pool = await create_pool(settings)
+    secret = secrets.token_urlsafe(48)
+    try:
+        repo = AgentRepository(pool)
+        await repo.initialize()
+        async with Client(server_parameters(settings, secret), read_timeout_seconds=10) as client:
+            gateway = ToolGateway(client, secret, 10)
+            await gateway.discover()
+            assert len(gateway.tools) == 3
+            resource = await client.read_resource("schedule://current-week")
+            assert len(json.loads(resource.contents[0].text)["days"]) == 7
+            result = await gateway.call("get_schedule", {"date": "2026-11-09"})
+            assert result["lessons"] and result["lessons"][0]["title"]
+            future = datetime.now(UTC) + timedelta(days=1)
+            args = ReminderArgs(
+                text="Тест MCP", remind_at=future.astimezone(ZoneInfo("Europe/Moscow")).isoformat()
+            )
+            denied = await client.call_tool("add_reminder", args.model_dump())
+            assert denied.is_error
+            row = await repo.prepare(11, 100, args, "Europe/Moscow")
+            await repo.confirm(11, str(row["id"]))
+            results = await asyncio.gather(
+                *(gateway.call("add_reminder", args.model_dump(), str(row["id"])) for _ in range(2))
+            )
+            assert sum(r["created"] for r in results) == 1
+            assert results[0]["id"] == results[1]["id"]
+            assert await pool.fetchval("SELECT count(*) FROM lab2_reminders") == 1
+    finally:
+        await pool.close()

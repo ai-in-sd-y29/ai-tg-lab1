@@ -1,0 +1,478 @@
+{
+  "date": "2026-11-11T08:38:04.628541+00:00",
+  "client": "mcp.Client, independent of ToolGateway",
+  "tools": [
+    {
+      "name": "get_weather",
+      "title": null,
+      "description": "Текущая погода, температура, ветер и условия в городе. Также для вопроса о зонте. city: именительный падеж; если указана страна, сохраняй её через запятую. Не угадывай город. Только чтение.",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "city": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "City",
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "title": "WeatherArgs"
+      },
+      "execution": null,
+      "output_schema": {
+        "$defs": {
+          "Candidate": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "country": {
+                "title": "Country",
+                "type": "string"
+              },
+              "admin1": {
+                "title": "Admin1",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "country",
+              "admin1"
+            ],
+            "title": "Candidate",
+            "type": "object"
+          },
+          "CurrentWeather": {
+            "additionalProperties": false,
+            "properties": {
+              "city": {
+                "title": "City",
+                "type": "string"
+              },
+              "country": {
+                "title": "Country",
+                "type": "string"
+              },
+              "admin1": {
+                "title": "Admin1",
+                "type": "string"
+              },
+              "temperature_c": {
+                "title": "Temperature C",
+                "type": "number"
+              },
+              "weather_code": {
+                "title": "Weather Code",
+                "type": "integer"
+              },
+              "wind_speed": {
+                "title": "Wind Speed",
+                "type": "number"
+              },
+              "wind_unit": {
+                "const": "km/h",
+                "default": "km/h",
+                "title": "Wind Unit",
+                "type": "string"
+              },
+              "observed_at": {
+                "title": "Observed At",
+                "type": "string"
+              },
+              "timezone": {
+                "title": "Timezone",
+                "type": "string"
+              }
+            },
+            "required": [
+              "city",
+              "country",
+              "admin1",
+              "temperature_c",
+              "weather_code",
+              "wind_speed",
+              "observed_at",
+              "timezone"
+            ],
+            "title": "CurrentWeather",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "const": "Open-Meteo",
+            "default": "Open-Meteo",
+            "title": "Source",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "not_found",
+              "ambiguous"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "candidates": {
+            "items": {
+              "$ref": "#/$defs/Candidate"
+            },
+            "title": "Candidates",
+            "type": "array"
+          },
+          "current": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CurrentWeather"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "WeatherResult",
+        "type": "object"
+      },
+      "icons": null,
+      "annotations": {
+        "title": null,
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": null
+      },
+      "meta": null
+    },
+    {
+      "name": "get_schedule",
+      "title": null,
+      "description": "Занятия пользователя на конкретную дату YYYY-MM-DD. Сегодня/завтра вычисляй по доверенному текущему времени. Только чтение.",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "date": {
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "title": "Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "date"
+        ],
+        "title": "ScheduleArgs"
+      },
+      "execution": null,
+      "output_schema": {
+        "$defs": {
+          "Lesson": {
+            "additionalProperties": false,
+            "properties": {
+              "start": {
+                "pattern": "^\\d{2}:\\d{2}$",
+                "title": "Start",
+                "type": "string"
+              },
+              "end": {
+                "pattern": "^\\d{2}:\\d{2}$",
+                "title": "End",
+                "type": "string"
+              },
+              "title": {
+                "maxLength": 500,
+                "minLength": 1,
+                "title": "Title",
+                "type": "string"
+              },
+              "location": {
+                "maxLength": 500,
+                "minLength": 1,
+                "title": "Location",
+                "type": "string"
+              }
+            },
+            "required": [
+              "start",
+              "end",
+              "title",
+              "location"
+            ],
+            "title": "Lesson",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "default": "Учебное вымышленное расписание",
+            "title": "Source",
+            "type": "string"
+          },
+          "date": {
+            "title": "Date",
+            "type": "string"
+          },
+          "lessons": {
+            "items": {
+              "$ref": "#/$defs/Lesson"
+            },
+            "title": "Lessons",
+            "type": "array"
+          }
+        },
+        "required": [
+          "date",
+          "lessons"
+        ],
+        "title": "ScheduleResult",
+        "type": "object"
+      },
+      "icons": null,
+      "annotations": {
+        "title": null,
+        "read_only_hint": true,
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": null
+      },
+      "meta": null
+    },
+    {
+      "name": "add_reminder",
+      "title": null,
+      "description": "Подготовить напоминание: text — только содержание без слова Напомни; remind_at — точные ISO дата и время с offset сохранённого часового пояса. Неполную дату/время уточни. Приложение запросит подтверждение перед созданием.",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          },
+          "remind_at": {
+            "title": "Remind At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "remind_at"
+        ],
+        "title": "ReminderArgs"
+      },
+      "execution": null,
+      "output_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "remind_at": {
+            "title": "Remind At",
+            "type": "string"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "remind_at",
+          "timezone",
+          "created"
+        ],
+        "title": "ReminderResult",
+        "type": "object"
+      },
+      "icons": null,
+      "annotations": {
+        "title": null,
+        "read_only_hint": false,
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": null
+      },
+      "meta": null
+    }
+  ],
+  "resources": [
+    {
+      "name": "Расписание текущей недели",
+      "title": null,
+      "uri": "schedule://current-week",
+      "description": null,
+      "mime_type": "application/json",
+      "size": null,
+      "icons": null,
+      "annotations": null,
+      "meta": null
+    }
+  ],
+  "week": {
+    "timezone": "Europe/Moscow",
+    "monday": "2026-11-09",
+    "sunday": "2026-11-15",
+    "days": [
+      {
+        "source": "Учебное вымышленное расписание",
+        "date": "2026-11-09",
+        "lessons": [
+          {
+            "start": "10:00",
+            "end": "11:30",
+            "title": "Программирование",
+            "location": "Учебная аудитория А"
+          },
+          {
+            "start": "12:00",
+            "end": "13:30",
+            "title": "Разработка с помощью ИИ",
+            "location": "Учебная аудитория Б"
+          }
+        ]
+      },
+      {
+        "source": "Учебное вымышленное расписание",
+        "date": "2026-11-10",
+        "lessons": [
+          {
+            "start": "10:00",
+            "end": "11:30",
+            "title": "Математика",
+            "location": "Учебная аудитория А"
+          },
+          {
+            "start": "12:00",
+            "end": "13:30",
+            "title": "Базы данных",
+            "location": "Учебная аудитория Б"
+          }
+        ]
+      },
+      {
+        "source": "Учебное вымышленное расписание",
+        "date": "2026-11-11",
+        "lessons": [
+          {
+            "start": "10:00",
+            "end": "11:30",
+            "title": "Разработка с помощью ИИ",
+            "location": "Учебная аудитория А"
+          },
+          {
+            "start": "12:00",
+            "end": "13:30",
+            "title": "Английский язык",
+            "location": "Учебная аудитория Б"
+          }
+        ]
+      },
+      {
+        "source": "Учебное вымышленное расписание",
+        "date": "2026-11-12",
+        "lessons": [
+          {
+            "start": "10:00",
+            "end": "11:30",
+            "title": "Базы данных",
+            "location": "Учебная аудитория А"
+          },
+          {
+            "start": "12:00",
+            "end": "13:30",
+            "title": "Программирование",
+            "location": "Учебная аудитория Б"
+          }
+        ]
+      },
+      {
+        "source": "Учебное вымышленное расписание",
+        "date": "2026-11-13",
+        "lessons": [
+          {
+            "start": "10:00",
+            "end": "11:30",
+            "title": "Английский язык",
+            "location": "Учебная аудитория А"
+          },
+          {
+            "start": "12:00",
+            "end": "13:30",
+            "title": "Математика",
+            "location": "Учебная аудитория Б"
+          }
+        ]
+      },
+      {
+        "source": "Учебное вымышленное расписание",
+        "date": "2026-11-14",
+        "lessons": []
+      },
+      {
+        "source": "Учебное вымышленное расписание",
+        "date": "2026-11-15",
+        "lessons": []
+      }
+    ]
+  },
+  "schedule": {
+    "source": "Учебное вымышленное расписание",
+    "date": "2026-11-09",
+    "lessons": [
+      {
+        "start": "10:00",
+        "end": "11:30",
+        "title": "Программирование",
+        "location": "Учебная аудитория А"
+      },
+      {
+        "start": "12:00",
+        "end": "13:30",
+        "title": "Разработка с помощью ИИ",
+        "location": "Учебная аудитория Б"
+      }
+    ]
+  },
+  "write_without_trusted_context_denied": true,
+  "weather": {
+    "is_error": false,
+    "data": {
+      "source": "Open-Meteo",
+      "status": "ok",
+      "candidates": [],
+      "current": {
+        "city": "Тбилиси",
+        "country": "Грузия",
+        "admin1": "Тбилиси",
+        "temperature_c": 7.5,
+        "weather_code": 1,
+        "wind_speed": 4.2,
+        "wind_unit": "km/h",
+        "observed_at": "2026-11-11T12:30:00+04:00",
+        "timezone": "Asia/Tbilisi"
+      }
+    }
+  }
+}

@@ -1,16 +1,20 @@
 import argparse
 import asyncio
 import logging
+from contextlib import AsyncExitStack
 
 from aiogram import Dispatcher
 
+from app.agent import Agent
 from app.config import ConfigError, Settings
 from app.db import create_pool
 from app.dialogue import Dialogue
 from app.handlers.assistant import create_router
 from app.health import HealthState, start_health_server
+from app.lab2_repository import AgentRepository
 from app.llm import LLMClient
 from app.logging_setup import configure_logging
+from app.mcp_client import connect_gateway
 from app.repository import Repository
 from app.telegram import create_bot
 
@@ -22,6 +26,7 @@ async def run(settings: Settings) -> None:
     bot = create_bot(settings)
     runner = None
     llm = LLMClient(settings)
+    mcp_stack = AsyncExitStack()
     try:
         state.pool = await create_pool(settings)
         logger.info("PostgreSQL подключён: SELECT 1 выполнен.")
@@ -38,6 +43,10 @@ async def run(settings: Settings) -> None:
         repository = Repository(state.pool)
         await repository.initialize()
         dialogue = Dialogue(repository, llm, settings)
+        agent_repository = AgentRepository(state.pool)
+        await agent_repository.initialize()
+        gateway = await mcp_stack.enter_async_context(connect_gateway(settings))
+        agent = Agent(dialogue, agent_repository, gateway)
         dispatcher = Dispatcher()
         dispatcher.include_router(create_router())
         runner = await start_health_server(state, settings.health_port)
@@ -46,6 +55,7 @@ async def run(settings: Settings) -> None:
                 bot,
                 db=state.pool,
                 dialogue=dialogue,
+                agent=agent,
                 allowed_updates=dispatcher.resolve_used_update_types(),
                 close_bot_session=False,
             )
@@ -61,6 +71,7 @@ async def run(settings: Settings) -> None:
             await runner.cleanup()
         await bot.session.close()
         await llm.close()
+        await mcp_stack.aclose()
         if state.pool:
             try:
                 async with asyncio.timeout(10):

@@ -32,6 +32,10 @@ class Settings:
     llm_max_tokens: int = 1000
     history_max_messages: int = 20
     context_max_bytes: int = 24000
+    schedule_path: str = "data/schedule.json"
+    schedule_timezone: str = "Europe/Moscow"
+    mcp_timeout: int = 20
+    weather_timeout: int = 10
 
     @classmethod
     def load(
@@ -122,6 +126,13 @@ class Settings:
                 _ = endpoint.port
             except ValueError:
                 raise ConfigError("LLM_BASE_URL: нужен HTTPS-адрес без учётных данных.") from None
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        schedule_timezone = value("SCHEDULE_TIMEZONE", "Europe/Moscow")
+        try:
+            ZoneInfo(schedule_timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ConfigError("SCHEDULE_TIMEZONE: нужна существующая IANA-зона.") from None
         return cls(
             bot_token=token,
             postgres_password=password,
@@ -139,4 +150,8 @@ class Settings:
             llm_max_tokens=positive("LLM_MAX_TOKENS", 1000),
             history_max_messages=positive("HISTORY_MAX_MESSAGES", 20),
             context_max_bytes=positive("CONTEXT_MAX_BYTES", 24000),
+            schedule_path=value("SCHEDULE_PATH", "data/schedule.json"),
+            schedule_timezone=schedule_timezone,
+            mcp_timeout=positive("MCP_TIMEOUT", 20),
+            weather_timeout=positive("WEATHER_TIMEOUT", 10),
         )

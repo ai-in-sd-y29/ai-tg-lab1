@@ -119,3 +119,51 @@ async def test_connection_refused_is_safe(api):
     client.settings = replace(client.settings, llm_base_url="http://127.0.0.1:1/v1")
     with pytest.raises(LLMError, match="transport_or_format"):
         await client.complete([], 0.3)
+
+
+async def test_native_tool_calls_preserve_arguments_and_do_not_use_response_format(api):
+    client, state, requests = api
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "index": 0,
+                "type": "function",
+                "function": {"name": "get_schedule", "arguments": '{"date":"2026-10-12"}'},
+            }
+        ],
+    }
+    state["response"] = {"choices": [{"message": message, "finish_reason": "tool_calls"}]}
+    tools = [
+        {"type": "function", "function": {"name": "get_schedule", "parameters": {"type": "object"}}}
+    ]
+    assert await client.agent_turn([], 0.0, tools) == message
+    assert requests[0][0]["tools"] == tools
+    assert "response_format" not in requests[0][0]
+    assert len(requests) == 1
+
+
+async def test_text_response_uses_separate_json_schema_request(api):
+    client, state, requests = api
+    state["response"] = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '{"action":"clarify","text":"Уточните время"}',
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    tools = [
+        {"type": "function", "function": {"name": "get_schedule", "parameters": {"type": "object"}}}
+    ]
+    result = await client.agent_turn([], 0.3, tools)
+    assert "clarify" in result["content"]
+    assert len(requests) == 2
+    assert requests[0][0]["tools"] == tools
+    assert requests[1][0]["response_format"]["json_schema"]["strict"] is True
+    assert "tools" not in requests[1][0]

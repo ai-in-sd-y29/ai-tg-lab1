@@ -4,3 +4,4 @@
 *.ps1 text eol=lf
 *.yaml text eol=lf
 *.md text eol=lf
+docs/evaluation/lab2-routing.json text eol=lf

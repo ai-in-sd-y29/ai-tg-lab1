@@ -39,6 +39,44 @@ class LLMClient:
             await self.session.close()
 
     async def complete(self, messages: list[dict[str, str]], temperature: float) -> Completion:
+        data = await self.generate(messages, temperature)
+        try:
+            choice = data["choices"][0]
+            text = choice["message"]["content"]
+            if (
+                not isinstance(text, str)
+                or not text.strip()
+                or choice.get("finish_reason") != "stop"
+            ):
+                raise LLMError("empty_or_incomplete")
+            return Completion(text, data.get("usage") or {}, data.get("model", ""))
+        except (KeyError, IndexError, TypeError):
+            raise LLMError("transport_or_format") from None
+
+    async def agent_turn(self, messages: list[dict], temperature: float, tools: list[dict]) -> dict:
+        data = await self.generate(messages, temperature, tools)
+        try:
+            choice = data["choices"][0]
+            if choice.get("finish_reason") not in {"stop", "tool_calls"}:
+                raise LLMError("incomplete_response")
+            message = choice["message"]
+            if not isinstance(message, dict):
+                raise TypeError
+            if not message.get("tool_calls"):
+                # Yandex запрещает tools и response_format в одном запросе.
+                # Нативное решение уже получено; только обычный ответ/уточнение
+                # формируем вторым запросом по строгой JSON-схеме.
+                data = await self.generate(messages, temperature, reply_schema=True)
+                if data["choices"][0].get("finish_reason") != "stop":
+                    raise LLMError("incomplete_response")
+                message = data["choices"][0]["message"]
+            return message
+        except (KeyError, IndexError, TypeError):
+            raise LLMError("transport_or_format") from None
+
+    async def generate(
+        self, messages: list[dict], temperature: float, tools=None, reply_schema: bool = False
+    ) -> dict:
         if self.session is None:
             self.session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.settings.llm_timeout),
@@ -51,17 +89,32 @@ class LLMClient:
         headers = {"Authorization": f"Bearer {self.settings.llm_api_key}"}
         if self.settings.llm_model.startswith("gpt://"):
             headers["OpenAI-Project"] = self.settings.llm_model.split("/")[2]
+        payload = {
+            "model": self.settings.llm_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": self.settings.llm_max_tokens,
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        if reply_schema:
+            from app.agent import TextDecision
+
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "agent_reply",
+                    "strict": True,
+                    "schema": TextDecision.model_json_schema(),
+                },
+            }
         try:
             async with self.session.post(
                 self.settings.llm_base_url + "/chat/completions",
                 headers=headers,
-                json={
-                    "model": self.settings.llm_model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": self.settings.llm_max_tokens,
-                    "stream": False,
-                },
+                json=payload,
                 allow_redirects=False,
             ) as response:
                 if response.status != 200:
@@ -73,13 +126,8 @@ class LLMClient:
                     if len(raw) > 1_000_000:
                         raise LLMError("response_too_large")
                 data = json.loads(raw)
-                choice = data["choices"][0]
-                text = choice["message"]["content"]
-                if not isinstance(text, str) or not text.strip():
-                    raise LLMError("empty_response")
-                if choice.get("finish_reason") != "stop":
-                    raise LLMError("incomplete_response")
-                result = Completion(text, data.get("usage") or {}, data.get("model", ""))
+                if not isinstance(data, dict):
+                    raise TypeError
         except LLMError as exc:
             logger.warning(
                 "LLM failure request=%s code=%s elapsed=%.2f",
@@ -96,4 +144,4 @@ class LLMClient:
             )
             raise LLMError("transport_or_format") from None
         logger.info("LLM success request=%s elapsed=%.2f", request_id, time.monotonic() - started)
-        return result
+        return data

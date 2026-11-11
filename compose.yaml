@@ -41,6 +41,10 @@ services:
       LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-1000}
       HISTORY_MAX_MESSAGES: ${HISTORY_MAX_MESSAGES:-20}
       CONTEXT_MAX_BYTES: ${CONTEXT_MAX_BYTES:-24000}
+      SCHEDULE_PATH: ${SCHEDULE_PATH:-data/schedule.json}
+      SCHEDULE_TIMEZONE: ${SCHEDULE_TIMEZONE:-Europe/Moscow}
+      MCP_TIMEOUT: ${MCP_TIMEOUT:-20}
+      WEATHER_TIMEOUT: ${WEATHER_TIMEOUT:-10}
     depends_on:
       db:
         condition: service_healthy

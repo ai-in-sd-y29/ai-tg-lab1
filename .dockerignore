@@ -4,6 +4,8 @@
 !constraints.txt
 !app/
 !app/**
+!data/
+!data/*.json
 **/__pycache__/
 **/*.pyc
 **/.env*
