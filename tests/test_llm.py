@@ -167,3 +167,58 @@ async def test_text_response_uses_separate_json_schema_request(api):
     assert requests[0][0]["tools"] == tools
     assert requests[1][0]["response_format"]["json_schema"]["strict"] is True
     assert "tools" not in requests[1][0]
+
+
+async def test_text_clarification_keeps_discovered_weather_capability(api):
+    client, state, requests = api
+    state["response"] = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '{"action":"clarify","text":"Для какого города нужна погода?"}',
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    messages = [
+        {"role": "system", "content": "Инструкция"},
+        {"role": "user", "content": "get_weather"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Текущая погода в городе",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    await client.agent_turn(messages, 0.3, tools)
+    context = requests[1][0]["messages"][0]["content"]
+    assert "get_weather" in context and '"city"' in context
+    assert "Текущая погода в городе" in context
+    assert requests[1][0]["messages"][-1] == messages[-1]
+    assert messages[0]["content"] == "Инструкция"
+    assert "tools" not in requests[1][0]
+
+
+async def test_provider_content_filter_is_explicit_and_not_retried(api):
+    client, state, requests = api
+    state["response"] = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "refused"},
+                "finish_reason": "content_filter",
+            }
+        ]
+    }
+    with pytest.raises(LLMError, match="content_filtered"):
+        await client.agent_turn([], 0.3, [])
+    assert len(requests) == 1

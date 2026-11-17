@@ -42,6 +42,8 @@ class LLMClient:
         data = await self.generate(messages, temperature)
         try:
             choice = data["choices"][0]
+            if choice.get("finish_reason") == "content_filter":
+                raise LLMError("content_filtered")
             text = choice["message"]["content"]
             if (
                 not isinstance(text, str)
@@ -57,6 +59,8 @@ class LLMClient:
         data = await self.generate(messages, temperature, tools)
         try:
             choice = data["choices"][0]
+            if choice.get("finish_reason") == "content_filter":
+                raise LLMError("content_filtered")
             if choice.get("finish_reason") not in {"stop", "tool_calls"}:
                 raise LLMError("incomplete_response")
             message = choice["message"]
@@ -66,7 +70,23 @@ class LLMClient:
                 # Yandex запрещает tools и response_format в одном запросе.
                 # Нативное решение уже получено; только обычный ответ/уточнение
                 # формируем вторым запросом по строгой JSON-схеме.
-                data = await self.generate(messages, temperature, reply_schema=True)
+                capabilities = [tool["function"] for tool in tools]
+                formatting_context = (
+                    "Доступные инструменты приложения и их параметры: "
+                    + json.dumps(capabilities, ensure_ascii=False)
+                    + "\nСейчас сформируй текстовый ответ или уточнение по JSON-схеме. "
+                    "При непустом списке инструменты доступны приложению. "
+                    "Если пользователь указал только имя инструмента, попроси недостающие "
+                    "обязательные параметры. Данные выполненных вызовов бери из сообщений tool."
+                )
+                reply_messages = [dict(item) for item in messages]
+                if reply_messages and reply_messages[0].get("role") == "system":
+                    reply_messages[0]["content"] += "\n" + formatting_context
+                else:
+                    reply_messages.insert(0, {"role": "system", "content": formatting_context})
+                data = await self.generate(reply_messages, temperature, reply_schema=True)
+                if data["choices"][0].get("finish_reason") == "content_filter":
+                    raise LLMError("content_filtered")
                 if data["choices"][0].get("finish_reason") != "stop":
                     raise LLMError("incomplete_response")
                 message = data["choices"][0]["message"]

@@ -20,7 +20,9 @@ from app.tool_services import ScheduleService, WeatherService
 DESCRIPTIONS = {
     "get_weather": "Текущая погода, температура, ветер и условия в городе. "
     "Также для вопроса о зонте. city: именительный падеж; если указана страна, "
-    "сохраняй её через запятую. Не угадывай город. Только чтение.",
+    "сохраняй её через запятую. При выборе из вариантов обязательно сохрани также выбранную "
+    "область: city = «город, страна, область». Не отбрасывай область из ответа пользователя. "
+    "Не угадывай город. Только чтение.",
     "get_schedule": "Занятия пользователя на конкретную дату YYYY-MM-DD. "
     "Сегодня/завтра вычисляй по доверенному текущему времени. Только чтение.",
     "add_reminder": "Подготовить напоминание: text — только содержание без слова Напомни; "
@@ -28,12 +30,35 @@ DESCRIPTIONS = {
     "Неполную дату/время уточни. Приложение запросит подтверждение перед созданием.",
 }
 
+TOOL_PRESENTATIONS = {
+    "get_weather": {
+        "title": "Погода",
+        "icon": "🌦️",
+        "summary": "Температура, погодные условия и ветер в выбранном городе.",
+        "example": "Какая сейчас погода в Воронеже?",
+    },
+    "get_schedule": {
+        "title": "Расписание",
+        "icon": "📚",
+        "summary": "Занятия на нужную дату, время и место проведения.",
+        "example": "Какие занятия у меня завтра?",
+    },
+    "add_reminder": {
+        "title": "Напоминания",
+        "icon": "🔔",
+        "summary": "Сохранение напоминания после вашего подтверждения.",
+        "example": "Через два часа напомни сделать перерыв.",
+    },
+}
+
 
 def tool_definitions() -> list[types.Tool]:
     return [
         types.Tool(
             name=name,
+            title=TOOL_PRESENTATIONS[name]["title"],
             description=description,
+            meta={"ui": TOOL_PRESENTATIONS[name]},
             input_schema=INPUT_MODELS[name].model_json_schema(),
             output_schema=OUTPUT_MODELS[name].model_json_schema(),
             annotations=types.ToolAnnotations(

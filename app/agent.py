@@ -17,12 +17,20 @@ from app.lab2_models import (
     NativeCall,
     ReminderArgs,
     StrictModel,
+    WeatherResult,
     normalize_reminder,
 )
 from app.llm import LLMError
 from app.prompts import PROMPTS
+from app.weather_formatting import format_weather
 
 logger = logging.getLogger(__name__)
+
+WEATHER_CHOICES_PREFIX = "Уточните город, страну и область:\n"
+WEATHER_CLARIFICATION = (
+    "Для получения текущей погоды найдено несколько населённых пунктов. "
+    "Уточните город, страну и область."
+)
 
 RULES = """
 Ты также агент студента. Используй только предоставленные нативные инструменты.
@@ -39,6 +47,10 @@ RULES = """
 При изменении текста/времени напоминания вызови add_reminder для нового подтверждения.
 Действие add_reminder только предлагает операцию: создание подтверждает приложение.
 При получении результата чтения ответь кратко, указав источник и фактические значения.
+Для погоды используй готовую сводку presentation из результата инструмента,
+сохрани её строки, значки, значения и единицы измерения. Не добавляй вступления и разметку.
+Если пользователь задал дополнительный вопрос о погоде, после сводки кратко ответь на него
+по полученным данным. Отсутствующие погодные показатели не придумывай.
 Не объявляй успех при ошибке или отсутствии данных.
 Если нативный инструмент не нужен, верни ТОЛЬКО JSON объект:
 {"action":"respond" или "clarify","text":"ответ или уточняющий вопрос"}.
@@ -99,11 +111,25 @@ class Agent:
     async def tools(self):
         if not self.gateway.available:
             return ERRORS["mcp_unavailable"]
-        return "Доступные инструменты:\n" + "\n".join(
-            f"• {t.name} — {t.description} "
-            f"({'чтение' if t.annotations and t.annotations.read_only_hint else 'изменение'})"
-            for t in self.gateway.tools.values()
+        blocks = ["🧰 Доступные инструменты"]
+        for tool in self.gateway.tools.values():
+            ui = (tool.meta or {}).get("ui", {})
+            title = tool.title or tool.name
+            summary = ui.get("summary") or (tool.description or "").split(". ", 1)[0]
+            access = (
+                "🔎 Чтение данных"
+                if tool.annotations and tool.annotations.read_only_hint
+                else "✍️ Изменение данных · нужно подтверждение"
+            )
+            lines = [f"{ui.get('icon', '🔧')} {title} · {tool.name}", summary, access]
+            if ui.get("example"):
+                lines.append(f"Пример  «{ui['example']}»")
+            blocks.append("\n".join(line for line in lines if line))
+        blocks.append(
+            "Напишите запрос обычным сообщением.\n"
+            "Для напоминаний задайте часовой пояс через /timezone Europe/Moscow."
         )
+        return "\n\n".join(blocks)
 
     async def why(self, owner):
         from zoneinfo import ZoneInfo
@@ -152,6 +178,15 @@ class Agent:
             history = await self.dialogue.repository.history(
                 owner, self.dialogue.settings.history_max_messages // 2
             )
+            # Включая ранее сохранённые диалоги: список вариантов нужен для интерфейса,
+            # а для следующего LLM-вызова достаточно намерения и выбранного пользователем города.
+            history = [
+                {**item, "content": WEATHER_CLARIFICATION}
+                if item["role"] == "assistant"
+                and item["content"].startswith(WEATHER_CHOICES_PREFIX)
+                else item
+                for item in history
+            ]
             s = self.dialogue.settings
             messages = build_context(
                 prompt(profile.mode, self.clock(), zone),
@@ -238,13 +273,19 @@ class Agent:
                         if result["status"] == "not_found":
                             response = "Город не найден. Уточните название и страну."
                         else:
-                            response = "Уточните город, страну и область:\n" + "\n".join(
+                            response = WEATHER_CHOICES_PREFIX + "\n".join(
                                 f"• {c['name']}, {c['country']}, {c['admin1']}"
                                 for c in result["candidates"]
                             )
                         reply = AgentReply(response)
                         reason = "Неоднозначное название города или город не найден"
                         break
+                    if tool == "get_weather":
+                        try:
+                            presentation = format_weather(WeatherResult.model_validate(result))
+                        except (ValueError, KeyError):
+                            raise AgentError("invalid_tool_result") from None
+                        result = {**result, "presentation": presentation}
                     messages.append(
                         {
                             "role": "tool",
@@ -258,7 +299,12 @@ class Agent:
             else:
                 raise AgentError("call_limit")
             await self.dialogue.repository.save_turn(
-                owner, text, reply.text, max(1, s.history_max_messages // 2)
+                owner,
+                text,
+                WEATHER_CLARIFICATION
+                if reply.text.startswith(WEATHER_CHOICES_PREFIX)
+                else reply.text,
+                max(1, s.history_max_messages // 2),
             )
             return reply
         except AgentError as exc:

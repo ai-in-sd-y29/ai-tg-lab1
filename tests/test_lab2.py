@@ -328,6 +328,11 @@ async def test_agent_clarification_and_safe_tools_list(agent_harness):
     assert repo.audit.call_args.args[1] == "clarify"
     listing = await agent.tools()
     assert all(name in listing for name in ["get_weather", "get_schedule", "add_reminder"])
+    assert "📚 Расписание · get_schedule" in listing
+    assert "Пример  «Какие занятия у меня завтра?»" in listing
+    assert "✍️ Изменение данных · нужно подтверждение" in listing
+    gateway.tools.pop("get_weather")
+    assert "get_weather" not in await agent.tools()
     repo.prepare.assert_not_awaited()
 
 
@@ -388,3 +393,109 @@ async def test_audit_correlates_without_logging_telegram_id_or_query(agent_harne
     request_id = repo.audit.call_args.kwargs["request_id"]
     assert len(request_id) == 32 and request_id in caplog.text
     assert str(owner) not in caplog.text and text not in caplog.text
+
+
+async def test_weather_exact_city_matches_exclude_prefix_matches():
+    service = WeatherService()
+    places = [
+        {"name": "Воронеж", "country": "Россия", "admin1": "Воронежская Область"},
+        {"name": "Воронеж", "country": "Украина", "admin1": "Сумская область"},
+        {"name": "Воронежское", "country": "Россия", "admin1": "Тамбовская Область"},
+    ]
+    service.fetch = AsyncMock(return_value={"results": places})
+    result = await service.weather("Воронеж")
+    assert result.status == "ambiguous"
+    assert len(result.candidates) == 2
+    assert all(candidate.name == "Воронеж" for candidate in result.candidates)
+    assert service.fetch.await_count == 1
+
+
+async def test_weather_selection_uses_compact_context_for_legacy_dialogues(agent_harness):
+    from app.agent import WEATHER_CHOICES_PREFIX, WEATHER_CLARIFICATION
+
+    agent, repo, llm, gateway = agent_harness
+    old_list = WEATHER_CHOICES_PREFIX + "• Воронеж, Россия\n• Воронеж, Украина"
+    await agent.dialogue.repository.profile(11)
+    await agent.dialogue.repository.save_turn(11, "Погода в Воронеже?", old_list, 10)
+    selected = "• Воронеж, Россия, Воронежская Область"
+    llm.agent_turn.return_value = reply("Уточнение принято")
+    await agent.answer(11, selected, 2)
+    messages = llm.agent_turn.call_args.args[0]
+    assert messages[2] == {"role": "assistant", "content": WEATHER_CLARIFICATION}
+    assert messages[-1] == {"role": "user", "content": selected}
+    assert old_list not in [item["content"] for item in messages]
+
+
+async def test_weather_candidates_displayed_but_compact_context_saved(agent_harness):
+    from app.agent import WEATHER_CHOICES_PREFIX, WEATHER_CLARIFICATION
+
+    agent, repo, llm, gateway = agent_harness
+    llm.agent_turn.return_value = tool_call("get_weather", {"city": "Воронеж"})
+    gateway.call.return_value = {
+        "status": "ambiguous",
+        "candidates": [
+            {"name": "Воронеж", "country": "Россия", "admin1": "Воронежская Область"},
+            {"name": "Воронеж", "country": "Украина", "admin1": "Сумская область"},
+        ],
+    }
+    result = await agent.answer(11, "Погода в Воронеже?", 1)
+    assert result.text.startswith(WEATHER_CHOICES_PREFIX)
+    assert "Воронежская Область" in result.text and "Сумская область" in result.text
+    history = await agent.dialogue.repository.history(11, 10)
+    assert history[-1]["content"] == WEATHER_CLARIFICATION
+
+
+def test_weather_summary_has_readable_units_conditions_and_local_time():
+    from app.lab2_models import CurrentWeather, WeatherResult
+    from app.weather_formatting import format_weather
+
+    result = WeatherResult(
+        status="ok",
+        current=CurrentWeather(
+            city="Воронеж",
+            country="Россия",
+            admin1="Воронежская область",
+            temperature_c=1.0,
+            weather_code=3,
+            wind_speed=12.4,
+            observed_at="2026-11-17T11:15:00+00:00",
+            timezone="Europe/Moscow",
+        ),
+    )
+    assert format_weather(result) == (
+        "📍 Воронеж — погода сейчас\nВоронежская область, Россия\n"
+        "\n☁️ Пасмурно\n🌡️ Температура  +1 °C\n💨 Ветер  3,4 м/с (12,4 км/ч)\n"
+        "\n🕒 Данные на 17.11.2026, 14:15\nЧасовой пояс  Europe/Moscow\nИсточник  Open-Meteo"
+    )
+
+
+def test_weather_summary_handles_unknown_condition_and_empty_result():
+    from app.lab2_models import CurrentWeather, WeatherResult
+    from app.weather_formatting import format_weather
+
+    result = WeatherResult(
+        status="ok",
+        current=CurrentWeather(
+            city="Город",
+            country="Страна",
+            admin1="Город",
+            temperature_c=-2.5,
+            weather_code=999,
+            wind_speed=0.0,
+            observed_at="2026-11-17T14:15:00+00:00",
+            timezone="UTC",
+        ),
+    )
+    text = format_weather(result)
+    assert "Состояние погоды не определено" in text and "-2,5 °C" in text
+    assert "0,0 м/с (0 км/ч)" in text
+    with pytest.raises(ValueError, match="current_weather_required"):
+        format_weather(WeatherResult(status="not_found"))
+
+
+async def test_weather_summary_rejects_missing_current_data_safely(agent_harness):
+    agent, repo, llm, gateway = agent_harness
+    llm.agent_turn.return_value = tool_call("get_weather", {"city": "Воронеж"})
+    gateway.call.return_value = {"source": "Open-Meteo", "status": "ok", "current": None}
+    result = await agent.answer(11, "Погода в Воронеже?", 1)
+    assert result.text == ERRORS["invalid_tool_result"]

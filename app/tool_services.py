@@ -92,6 +92,11 @@ class WeatherService:
             if not isinstance(places, list):
                 raise AgentError("weather_bad_response")
             qualifiers = [part.strip() for part in city.split(",")]
+            exact_matches = [
+                place for place in places if place["name"].casefold() == qualifiers[0].casefold()
+            ]
+            if exact_matches:
+                places = exact_matches
             if len(qualifiers) >= 3:
                 # Выбор страны и области из показанных кандидатов, без скрытого выбора первого.
                 places = [
